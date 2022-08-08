@@ -698,7 +698,7 @@ for(k in 1:G){
 
 ### Implementation function
 
-Imple = function(r,G,nb=100,p=6,n=500,S=50,rp=12,formula=Yf~V2+V3+V4+V5+V6+V7){
+Imple = function(r,G,nb=100,p=6,n=500,S=50,rp=10,formula=Yf~V2+V3+V4+V5+V6+V7){
   
   # Initialization
   I1 <- c()
