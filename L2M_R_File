@@ -1,550 +1,490 @@
 
-################# 
-
-library(flexmix)
-library(mvtnorm)
+############################################################ libraries ################################################################
 library(MASS)
 library(nlme)
-library(uniformly)
-library(MASS)  
+library(flexmix)
+library(mvtnorm)
+library(purrr)
+library(data.table)
+library(flexmix)
+library(lme4)
+library(mvtnorm)
+library(mclust)
+########################################################################################################################################
 
-####################################################################################################################################################################
 
-#### Matrix inversion function
+############################################################# Estimation functions ####################################################
 
-inverse_sym = function(M)
+################################################################### Data preparation function
+prepa_List = function(form,Dt, grping.Fact, rd.Fact)
 {
-  res <- eigen(M)
-  Inv_D <- diag(1/res$values)
-  P <- res$vectors
-  Inv_M <- (P%*%Inv_D)%*%t(P)
-  return(Inv_M)
-}
-
-
-
-
-######################################################################################################################################################################
-
-
-############### Initialization
-
-InitF = function(formula,Data,G)
-{
-  ### Best Flexmix model
-  AIC <- c()
-  resK <- list()
-  for(k in 1:10){
-    resK[[k]] <- flexmix(formula,Data,G)
-    AIC[k] <- AIC(resK[[k]])
-  }
-  res <- resK[[which.min(AIC)]]
-  
-  
-  ### Initial classification
-  u <- as.vector(clusters(res))
-  
-  ### Initial fixed effect parameters
-  A <- as.matrix(parameters(res))
-  MatBeta <- A[-dim(A)[1],]
-  
-  ### Initial variances
-  Vr <- rep(1,G)
-  Vi <- rep(1,G)
-  Ve <- rep(1,G)
-  
-  ### Initial probabilities
-  P <- as.vector(table(u)/dim(Data)[1])
-  
-  ### Results
-  return(list(P=P,MatBeta=MatBeta,Vr=Vr,Vi=Vi,Ve=Ve,Rgi=u))
-}
-
-
-#######################################################################################################################################################################
-
-################################## E-Step 
-
-### Indexation function
-VectInd = function(i,u)
-{
-  n <- length(u)
-  if(i==1)
+  ### Index of measurement per individuals
+  Sp <- Dt[,which(colnames(Dt)==grping.Fact)]
+  S <- length(unique(Sp))
+  ind.Sp <- list()
+  for(s in 1:S)
   {
-    a <- u[1]
-    b <- sum(u[2:n])
-    vc <- c(rep(1,a),rep(0,b))
-    return(vc)
+    ind.Sp[[s]] <- which(Sp==s)
   }
-  else if(i==n)
+  ### List of reponses
+  lst.Y <- list()
+  Y <- Dt[,1]
+  for(s in 1:S)
   {
-    a <- sum(u[1:(n-1)])
-    b <- u[n]
-    vc <- c(rep(0,a),rep(1,b))
-    return(vc)
+    lst.Y[[s]] <- Y[ind.Sp[[s]]]
   }
-  else
+  ### List of regression coefficients
+  rs1 <- lmer(form,Dt)
+  X <- as.data.frame(getME(rs1,"X"))
+  lst.X <- list()
+  for(s in 1:S)
   {
-    a <- sum(u[1:(i-1)])
-    b <- sum(u[(i+1):n])
-    vc <- c(rep(0,a),rep(1,u[i]),rep(0,b))
-    return(vc)
+    lst.X[[s]] <- X[ind.Sp[[s]],]
   }
-}
-
-
-### Expectation function
-Expect = function(Data,theta)
-{
-  m <-   ncol(Data)
-  n <- nrow(Data)
-  G <- length(theta$P)
-  ww <- rep(1,n)
-  X <- cbind(ww,Data[,-c(1,(m-1):m)])
-  u <- as.vector(Data[,m])
-  Ns <- length(unique(u))
-  MatVrai <- matrix(nrow=Ns,ncol=G)
-  nGs <- as.vector(table(u))
-  
-  for(s in 1:Ns)
+  ###  List of desing matrix
+  # Global desing
+  Dt2 <- data.table(Dt)
+  Dt2[, idMes:=.I]
+  glb.Z <- list()
+  for(i in 1:length(rd.Fact))
   {
-    Inds <- which(u==s)
-    
-    Ys <- as.vector(Data[,1])[Inds]
-    
-    a <- nGs[s]
-    Mat1 <- matrix(rep(1,a*a),ncol=a)
-    MatErr <- diag(1,a)
-    
-    uId <- as.vector(Data[Inds,m-1])
-    VId <- as.vector(table(uId))
-    if(length(VId)==1){
-      Zs <- diag(VId)
-    }
-    if(length(VId)!=1){
-      Zs <- sapply(1:length(VId),VectInd,VId)
-    }
-    Zf <- Zs%*%t(Zs)
-    d <- c()
-    for(k in 1:G)
+    b <- rd.Fact[i]
+    lst.lev <- list()
+    for(s in 1:S)
     {
-      Mus <- as.vector(as.matrix(X[Inds,])%*%matrix(theta$MatBeta[,k],ncol=1))
-      Vsk <- (Mat1*theta$Vi[k])+(Zf*theta$Ve[k])+(MatErr*theta$Vr[k])
-      MatVrai[s,k] <- theta$P[k]*dmvnorm(Ys,Mus,Vsk)
-      d[k] <- sqrt(sum(Mus^2))
+      lst.lev[[s]] <- as.matrix(dcast(Dt2[indEs==s], as.formula(paste("idMes~",paste(b))), fun.aggregate = length)[,-1])
     }
-    
+    glb.Z[[i]] <- lst.lev
   }
-  
-  u <-  apply(MatVrai,1,sum)
-  MatF <- MatVrai/u
-  return(list(MatF=MatF,MatVrai=MatVrai))
-}
-
-
-### Loglikelihood function
-LogVraiF= function(MatVrai)
-{
-  a <- apply(MatVrai,1,sum)
-  b <- log(a)
-  d1 <- sum(b)
-  return(d1)
-}
-
-
-#####################################################################################################################################################################
-
-
-######################################### Maximization-Step 
-
-### Maximization function
-Maxim = function(Data,MatF,theta)
-{
-  Ns <- nrow(MatF)
-  n <- nrow(Data)
-  m <- ncol(Data)
-  nvar <- m-2
-  G <- ncol(MatF)
-  a3 <- matrix(rep(1,n),ncol=1)
-  a4 <- as.matrix(Data[,-c(1,(nvar+1):m)])
-  X <- cbind(a3,a4)
-  Y <- as.vector(Data[,1])
-  
-  w <- apply(MatF,2,sum)
-  P <- w/Ns
-  
-  Beta <- matrix(nrow=nvar,ncol=G)
-  u <- as.vector(Data[,m])
-  nGs <- as.vector(table(u))
-  
-  for(k in 1:G)
+  # List of design per species
+  lst.Z <- list()
+  lst.Zt <- list()
+  for(s in 1:S)
   {
-    A <- matrix(nrow=nvar,ncol=Ns)
-    B <- array(dim=c(nvar,nvar,Ns))
-    
-    for(s in 1:Ns)
+    lz <- list()
+    lz[[1]]  <- diag(x=1,length(ind.Sp[[s]]))
+    for(i in 1:length(rd.Fact))
     {
-      
-      Inds <- which(u==s)
-      
-      Ys <- as.vector(Data[,1])[Inds]
-      
-      Xs <- X[Inds,]
-      
-      a <- nGs[s]
-      Mat1 <- matrix(rep(1,a*a),ncol=a)
-      MatErr <- diag(1,a)
-      
-      uId <- as.vector(Data[Inds,m-1])
-      VId <- as.vector(table(uId))
-      if(length(VId)==1){
-        Zs <- diag(VId)
+      ll <- glb.Z[[i]]
+      lz[[i+1]] <- ll[[s]]
+    }
+    lst.Z[[s]] <- lz
+    lst.Zt[[s]] <- lapply(lz,t)
+  }
+  ### results
+  return(list(Ys = lst.Y,Xs = lst.X, Zs = lst.Z,Zts = lst.Zt,ind.Sp=ind.Sp))
+}
+
+
+######################################################################### Initialization function
+Init = function(Dt,init.Clst,ind.Sp,form,rd.Fact,p)
+{
+  ### pi initialization
+  K <- length(unique(init.Clst))
+  pi <- c()
+  S <- length(init.Clst)
+  for(k in 1:K)
+  {
+    pi[k] <- sum(init.Clst==k)/S
+  }
+  ### fixed coefficients and random effect variances initialization
+  mat.Beta <- matrix(NA,ncol=K,nrow=p+1)
+  mat.Var <- matrix(NA,ncol=K,nrow=length(rd.Fact)+1)
+  for(k in 1:K)
+  {
+    u <- which(init.Clst==k)
+    Dtk <- Dt[ind.Sp[[u[1]]],]
+    for(i in 2:length(u))
+    {
+      Dtk2 <- Dt[ind.Sp[[u[i]]],]
+      Dtk <- rbind(Dtk,Dtk2)
+    }
+    rs <- lmer(form,Dtk)
+    mat.Beta[,k] <- as.numeric(getME(rs,"fixef"))
+    mat.Var[,k] <- c(as.numeric(getME(rs,"sigma")),as.numeric(getME(rs,"theta")))
+  }
+  ### Result
+  return(list(pi=pi,mat.Beta=mat.Beta,mat.Var=mat.Var))
+}
+
+
+############################################################################# Expectation function
+Expectation = function(theta,X,Y,Z,Zt)
+{
+  ### parameters of the previous iteration
+  mat.Var <- theta$mat.Var
+  mat.Bet <- theta$mat.Bet
+  pi <- theta$pi
+  K <- length(pi)
+  S <- length(X)
+  ### list of variance matrix
+  lst.Sg  <- list()
+  ### Matrix of likelihood
+  mat.phi <- matrix(NA,ncol=K,nrow=S)
+  for(k in 1:K)
+  {
+    # parameters for the meta population k
+    vr.k <- as.numeric(mat.Var[,k])
+    beta.k <- as.matrix(mat.Bet[,k],ncol=1)
+    # Variance matrix for meta population k
+    lst.Sg.s <- list()
+    # iteration at species level
+    for(s in 1:S)
+    {
+      Z.s <- Z[[s]]
+      Zt.s <- Zt[[s]]
+      Sig.sk <- vr.k[[1]]*(Z.s[[1]]%*%Zt.s[[1]])
+      for(le in 2:length(vr.k))
+      {
+        Sig.sk <- Sig.sk + vr.k[[le]]*(Z.s[[le]]%*%Zt.s[[le]])
       }
-      if(length(VId)!=1){
-        Zs <- sapply(1:length(VId),VectInd,VId)
-      }
-      Zf <- Zs%*%t(Zs)
-      Vsk <- (Mat1*theta$Vi[k])+(Zf*theta$Ve[k])+(MatErr*theta$Vr[k])
-      InVsk <- inverse_sym(Vsk)
-      
-      MatPond <- MatF[s,k]*t(Xs)
-      A[,s] <- (MatPond%*%InVsk)%*%Ys 
-      B[,,s] <- (MatPond%*%InVsk)%*%Xs
+      lst.Sg.s[[s]] <- Sig.sk
+      X.s <- as.matrix(X[[s]])
+      Mu.s <- as.vector(X.s %*% beta.k)
+      Y.s <- Y[[s]]
+      mat.phi[s,k] <-pi[k]*mvtnorm::dmvnorm(x = Y.s, mean = Mu.s, sigma = Sig.sk)
     }
-    NumK <- matrix(apply(A,1,sum),ncol=1)
-    DenumK <- B[,,1]
-    for(j in 2:Ns)
-    {
-      DenumK <- DenumK + B[,,j]
-    }
-    DenumK2 <- inverse_sym(DenumK)
-    
-    Beta[,k] <- as.vector(DenumK2%*%NumK)
+    lst.Sg[[k]] <- lst.Sg.s
   }
-  
-  VrS <- c()
-  VeS <- c()
-  ViS <- c()
-  for(k in 1:G)
-  {
-    U0k <- list(); U1k <- list(); U2k <- list(); U3k <- list(); U4k <- list(); U5k <- list() 
-    LY <- list() ; LX <- list()
-    
-    
-    for(s in 1:Ns)
-    {
-      
-      Inds <- which(u==s)
-      
-      Ys <- as.vector(Data[,1])[Inds]
-      LY[[s]] <- Ys
-      
-      Xs <- X[Inds,]
-      LX[[s]] <- Xs
-      
-      a <- nGs[s]
-      Mat1 <- matrix(rep(1,a*a),ncol=a)
-      MatErr <- diag(1,a)
-      
-      uId <- as.vector(Data[Inds,m-1])
-      VId <- as.vector(table(uId))
-      if(length(VId)==1){
-        Zs <- diag(VId)
-      }
-      if(length(VId)!=1){
-        Zs <- sapply(1:length(VId),VectInd,VId)
-      }
-      Zf <- Zs%*%t(Zs)
-      Vsk <- (Mat1*theta$Vi[k])+(Zf*theta$Ve[k])+(MatErr*theta$Vr[k])
-      InVsk <- solve(Vsk)
-      
-      U0k[[s]] <- InVsk%*%InVsk
-      U1k[[s]] <- (InVsk%*%Mat1)%*%InVsk
-      U2k[[s]] <- (InVsk%*%Zf)%*%InVsk
-      U3k[[s]] <- (InVsk%*%Mat1)%*%(InVsk%*%Mat1)
-      U4k[[s]] <- (InVsk%*%Mat1)%*%(InVsk%*%Zf)
-      U5k[[s]] <- (InVsk%*%Zf)%*%(InVsk%*%Zf)
-      
-    }
-    
-    TU0k <- c();  TU1k <- c(); TU2k <- c(); TU3k <- c(); TU4k <- c();  TU5k <- c();
-    for(s in 1:Ns)
-    {
-      TU0k[s] <- sum(diag(U0k[[s]]))
-      TU1k[s] <- sum(diag(U1k[[s]]))
-      TU2k[s] <- sum(diag(U2k[[s]]))
-      TU3k[s] <- sum(diag(U3k[[s]]))
-      TU4k[s] <- sum(diag(U4k[[s]]))
-      TU5k[s] <- sum(diag(U5k[[s]]))
-    }
-    M0k <- sum(MatF[,k]*TU0k)
-    M1k <- sum(MatF[,k]*TU1k) 
-    M2k <- sum(MatF[,k]*TU2k)
-    M3k <- sum(MatF[,k]*TU3k)
-    M4k <- sum(MatF[,k]*TU4k)
-    M5k <- sum(MatF[,k]*TU5k)
-    
-    VectMatBeta <- matrix(Beta[,k],ncol=1)
-    VR0 <- c(); VR1 <- c(); VR2 <- c()
-    for(s in 1:Ns)
-    {
-      EMu <- LY[[s]]-(LX[[s]]%*%VectMatBeta)
-      VR0[s] <- (t(EMu)%*%U0k[[s]])%*%EMu
-      VR1[s] <- (t(EMu)%*%U1k[[s]])%*%EMu
-      VR2[s] <- (t(EMu)%*%U2k[[s]])%*%EMu
-    }
-    R0sk <- sum(MatF[,k]*VR0)
-    R1sk <- sum(MatF[,k]*VR1)
-    R2sk <- sum(MatF[,k]*VR2)
-    
-    MatVarCal <- matrix(c(M0k,M1k,M2k,M1k,M3k,M4k,M2k,M4k,M5k),ncol=3)
-    MX <- matrix(c(R0sk,R1sk,R2sk,M1k,M3k,M4k,M2k,M4k,M5k),ncol=3)
-    MY <- matrix(c(M0k,M1k,M2k,R0sk,R1sk,R2sk,M2k,M4k,M5k),ncol=3)
-    MZ <- matrix(c(M0k,M1k,M2k,M1k,M3k,M4k,R0sk,R1sk,R2sk),ncol=3)
-    
-    VrS[k] <- abs(det(MX)/det(MatVarCal))
-    ViS[k] <- abs(det(MY)/det(MatVarCal))
-    VeS[k] <- abs(det(MZ)/det(MatVarCal))
-  }
-  
-  return(list(MatBeta=Beta,P=P,Vi=ViS,Vr=VrS,Ve=VeS))
+  ### priors matrix
+  mat.flou <- t(apply(mat.phi,1,function(x){x/sum(x)}))
+  ### results
+  return(list(mat.flou = mat.flou, mat.phi = mat.phi,lst.mat.Var=lst.Sg))
 }
 
 
+########################################################################### Functions for maximization step
 
-#######################################################################################################################################################################
-
-######################################### EM-Algorithm 
-######## The first column of Data must be is Y, the last column must be the indicator of species and before it it must be the column of indicators of individuals
-
-EstimF = function(formula,Data,G,e=0.00001,Nb=30)
+#################################################### Beta maximization function
+Maxi_Beta <- function(Y,X,Inv.mat.var,mat.flou,ind.k)
 {
-  ### Initialisation
-  k <- 1
-  Cpt <- 1
-  while((k!=0)&(Cpt<=20))
+  mat.beta <- matrix(NA,ncol=length(ind.k),nrow=ncol(X[[1]]))
+  S <- nrow(mat.flou)
+  
+  for(i in 1:length(ind.k)){
+    k <- ind.k[i]
+    ListMaxNum <- list()
+    ListMaxDen <- list()
+    IVsk <- Inv.mat.var[[k]]
+    w <- mat.flou[,k]
+    for(s in 1:S){
+      Ys <- as.matrix(Y[[s]],ncol=1)
+      Xs <- as.matrix(X[[s]])
+      IVs <- as.matrix(IVsk[[s]])
+      ListMaxNum[[s]] <- w[s]*t(Xs)%*%IVs%*%Ys
+      ListMaxDen[[s]] <- w[s]*t(Xs)%*%IVs%*%Xs
+    }
+    Num <- ListMaxNum[[1]]
+    DeNum <- ListMaxDen[[1]]
+    for(s in 2:S){
+      Num <- Num + ListMaxNum[[s]]
+      DeNum <- DeNum + ListMaxDen[[s]]
+    }
+    mat.beta[,i] <- solve(DeNum)%*%Num
+  }
+  return(mat.beta)
+}
+
+################################### M function for varaince maximization
+M_funct = function(k,mat.flou,Inv.mat.var,Z,Zt)
+{
+  ### affectations
+  w <- mat.flou[,k]
+  nl <- length(Z[[1]])
+  M <- matrix(ncol=nl,nrow=nl)
+  S <- nrow(mat.flou)
+  IVk <- Inv.mat.var[[k]]
+  
+  ### computing of matrix compoments
+  for(i in 1:nl)
   {
-    theta <- InitF(formula,Data,G)
+    for(j in 1:nl)
+    {
+      aZ <- c()
+      for(s in 1:S)
+      {
+        IVsk <- IVk[[s]]
+        Zs <- Z[[s]]
+        Zi <- Zs[[i]]
+        Zj <- Zs[[j]]
+        Zts <- Zt[[s]]
+        Zti <- Zts[[i]]
+        Ztj <- Zts[[j]]
+        Aij <- IVsk%*%Zi%*%Zti%*%IVsk%*%Zj%*%Ztj
+        aZ[s] <- w[s]*sum(diag(Aij))
+      }
+      M[i,j] <- sum(aZ)
+    }
+  }
+  return(M)
+}
+
+###################################### R function for varainces maximization
+R_funct = function(k,Y,X,Z,Zt,mat.Beta,Inv.mat.var,mat.flou)
+{
+  ### Affectation
+  S <- length(X)
+  w <- mat.flou[,k]
+  nl <- length(Z[[1]])
+  IVk <- Inv.mat.var[[k]]
+  
+  R <- c()
+  for(l in 1:nl)
+  {
+    aR <- c()
+    for(s in 1:S)
+    {
+      IVsk <- IVk[[s]]
+      Zs <- Z[[s]]
+      Zts <- Zt[[s]]
+      Zi <- Zs[[l]]
+      Zti <- Zts[[l]]
+      Mu <- as.matrix(X[[s]])%*%mat.Beta[,k]
+      A <- Y[[s]]-Mu
+      aR[s] <- w[s]*(t(A)%*%IVsk%*%Zi%*%Zti%*%IVsk%*%A)
+    }
+    R[l] <- sum(aR)
+  }
+  
+  return(R)
+}
+
+########################### Variance Maximization function
+Maxi_Var <- function(Y,X,Z,Zt,mat.Beta,mat.flou,Inv.mat.var,ind.k)
+{
+  nl <- length(Z[[1]])
+  mat.Var <- matrix(NA,ncol=length(ind.k),nrow=nl)
+  for(i in 1:length(ind.k))
+  {
+    k <- ind.k[i]
+    M <- M_funct(k,mat.flou,Inv.mat.var,Z,Zt)
+    R <- R_funct(i,Y,X,Z,Zt,mat.Beta,Inv.mat.var,mat.flou)
     
-    ### Control of values 
-    A <- as.matrix(table(theta$Rgi,Data[,ncol(Data)]))
-    Rg <- as.vector(apply(A,2,which.max))
-    nG2 <- length(unique(Rg))
-    nE2 <- length(Rg)
-    B <- matrix(ncol=nG2,nrow=nE2)
-    for(i in 1:nG2)
+    u <- solve(M,R)
+    mat.Var[,k] <- u
+  }
+  return(mat.Var)
+}
+
+
+###########################################################################  EM Maximization function
+Maximization = function(res.Exp,theta,Y,X,Z,Zt)
+{
+  ### recuperation of elements
+  mat.flou <- res.Exp$mat.flou
+  lst.mat.Var <- res.Exp$lst.mat.Var
+  mat.phi <- res.Exp$mat.phi
+  mat.Beta <- theta$mat.Beta
+  Inv.mat.var <- list()
+  for(k in 1:ncol(mat.flou))
+  {
+    Inv.mat.var[[k]] <- lapply(lst.mat.Var[[k]],solve)
+  }
+  
+  ### News K and S
+  u1 <- apply(mat.flou,2,sum)
+  ind.k <- which(u1!=0)
+  u <- u1[ind.k]
+  K <- length(u)
+  S <- nrow(mat.flou)
+  
+  ### News parameters
+  pi <- u/S
+  mat.Beta <- Maxi_Beta(Y,X,Inv.mat.var,mat.flou,ind.k)
+  mat.Var <- Maxi_Var(Y,X,Z,Zt,mat.Beta,mat.flou,Inv.mat.var,ind.k)
+  theta <- list(pi=pi,mat.Beta=mat.Beta,mat.Var=mat.Var)
+  
+  ### Result
+  return(theta)
+}
+
+############################################################################# ICL function
+icl.Mclust.MLMM <- function(res,Dt)
+{
+  if(class(res)=="try-error")
+  {
+    return(NA)
+  } else 
+  {
+    n <- nrow(Dt)
+    ## Matrix of probabilities
+    u <- Dt[,ncol(Dt)]
+    mat.Flou <- res$mat.flou
+    z <- matrix(0,nrow=length(u),ncol=ncol(mat.Flou))
+    for(kk in 1:nrow(mat.Flou))
     {
-      Id <- which(Rg==unique(Rg)[i])
-      u <- rep(0,nE2)
-      u[Id] <- 1
-      B[,i] <- u
+      a <- which(u==kk)
+      b <- mat.Flou[kk,]
+      for(kkk in 1:length(a))
+      {
+        z[a[kkk],] <- b
+      }
     }
-    uI <- apply(B,1,sum)
-    uItest <- which(uI==0)
-    k <- length(uItest)
-    Cpt <- Cpt+1
+    ## Matrix of behaviors
+    if(is.null(z)) z <- matrix(1, nrow = n, ncol = 1)
+    C <- matrix(0, n, ncol(z))
+    for(i in 1:n)
+      C[i, which.max(z[i,])] <- 1
+    ## ICL
+    log.vrai <- sum(log(apply(res$mat.phi,1,sum)))
+    N <- length(u)
+    k <- ncol(res$theta$mat.Beta)*(nrow(res$theta$mat.Beta)+nrow(res$theta$mat.Var))
+    bi <- (-2*log.vrai)+(k*log(N))
+    ic <- bi - 2*sum(C * ifelse(z > 0, log(z), 0))
+    return(list(BIC=bi,ICL=ic))
   }
-  if(ncol(B)==1)
+}
+
+
+################################################################################ EM function
+MLMM = function(form,Dt,init.Clst,grping.Fact,rd.Fact,eps=0.01,it.max=25)
+{
+  
+  ### Lists for computing
+  rs <- prepa_List(form,Dt,grping.Fact,rd.Fact)
+  X <- rs$Xs
+  Y <- rs$Ys
+  Z <- rs$Zs
+  Zt <- rs$Zts
+  ind.Sp <- rs$ind.Sp
+  p <- ncol(X[[1]])-1
+  
+  ### Initial parameters
+  theta <- Init(Dt,init.Clst,ind.Sp,form,rd.Fact,p)
+  # Test initialization
+  res.Exp <- Expectation(theta,X,Y,Z,Zt)
+  u1 <- apply(res.Exp$mat.phi,1,sum)
+  if(any(u1==0))
   {
-    nl <- length(unique(Data[,ncol(Data)]))
-    B <- matrix(rep(1,nl),ncol=1)
-    theta <- Maxim(Data,B,theta)
-    theta$MatBeta <- matrix(theta$MatBeta,ncol=1)
-    Rg <- rep(1,nl)
-    Rs <- 1
-    return(list(theta=theta,Rg=Rg,Rs=Rs))
+    message("Please try a new initialization")
+    return(theta)
   }
-  
-  Ge <- length(theta$P)
-  if(Ge<G)
-  {
-    theta$MatBeta <- theta$MatBeta[,-((Ge+1):G)]
-    theta$Vr <- theta$Vr[-((Ge+1):G)]
-    theta$Ve <- theta$Ve[-((Ge+1):G)]
-    theta$Vi <- theta$Vi[-((Ge+1):G)]
-    theta$P <- theta$P[-((Ge+1):G)]
-  }
-  
-  theta <- Maxim(Data,B,theta)
-  res <- Expect(Data,theta)
-  a <- apply(res$MatVrai,2,sum)
-  u1 <- which(a==0)
-  u2 <- which(a!=0)
-  if(length(u1)!=0)
-  {
-    theta$MatBeta <- theta$MatBeta[,-u1]
-    theta$Vr <- theta$Vr[-u1]
-    theta$Ve <- theta$Ve[-u1]
-    theta$Vi <- theta$Vi[-u1]
-    theta$P <- theta$P[-u1]
-    res$MatF <- res$MatF[-u1]
-    if(length(u2)==1)
-    {
-      Rg <- apply(res$MatVrai,1,which.max)
-      Rs=1
-      Vrai[1] <- LogVraiF(res$MatVrai)
-      return(list(theta=theta,Rg=Rg,Rs=Rs))
-    }
-  }
-  
-  b <- apply(res$MatVrai,1,sum)
-  Ind_b <- which(b==0)
-  if(length(Ind_b)!=0)
-  {
-    n_k <- length(Ind_b)
-    P_v <- ncol(res$MatVrai)
-    for(k in 1:n_k)
-    {
-      res$MatF[Ind_b[k],] <- B[Ind_b[k],]
-      a <- min(as.vector(res$MatVrai)[which(as.vector(res$MatVrai)!=0)])
-      Ind_a <- which(as.vector(B[Ind_b[k],])!=0)
-      res$MatVrai[Ind_b[k],][Ind_a] <- a
-    }
-  }
-  
-  
+  conv <- 0
+  lst.rs <- list(theta=theta,mat.flou=res.Exp$mat.flou,mat.phi=res.Exp$mat.phi,conv=conv)
   
   ### Iterations
-  Vrai <- c()
-  Vrai[1] <- LogVraiF(res$MatVrai)
-  test <- e+1
-  
-  
-  Rs <- 2
-  while((test > e)&(Rs<=Nb))
+  it <- 0
+  dif.lik <- eps+1
+  while((it<it.max)&&(dif.lik>eps))
   {
-    theta <- Maxim(Data,res$MatF,theta)
-    B <- res$MatF
-    
-    res <- Expect(Data,theta)
-    
-    ### Control of values
-    a <- apply(res$MatVrai,2,sum)
-    u1 <- which(a==0)
-    u2 <- which(a!=0)
-    if(length(u1)!=0)
+    ### Maximization
+    theta <- Maximization(res.Exp,theta,Y,X,Z,Zt)
+    res.Exp <- Expectation(theta,X,Y,Z,Zt)
+    u1 <- apply(res.Exp$mat.phi,1,sum)
+    if(any(u1==0))
     {
-      theta$MatBeta <- theta$MatBeta[,-u1]
-      theta$Vr <- theta$Vr[-u1]
-      theta$Ve <- theta$Ve[-u1]
-      theta$Vi <- theta$Vi[-u1]
-      theta$P <- theta$P[-u1]
-      res$MatF <- res$MatF[-u1]
-      if(length(u2)==1)
-      {
-        Rg <- apply(res$MatVrai,1,which.max)
-        Rs=1
-        Vrai[1] <- LogVraiF(res$MatVrai)
-        return(list(theta=theta,Rg=Rg,Rs=Rs))
-      }
+      ic <- icl.Mclust.MLMM(lst.rs,Dt)$ICL
+      return(list(theta=lst.rs$theta,matflou=lst.rs$mat.flou,mat.phi=lst.rs$mat.phi,ICL=ic,conv=lst.rs$conv))
     }
-    
-    b <- apply(res$MatVrai,1,sum)
-    Ind_b <- which(b==0)
-    if(length(Ind_b)!=0)
-    {
-      n_k <- length(Ind_b)
-      P_v <- ncol(res$MatVrai)
-      for(k in 1:n_k)
-      {
-        res$MatF[Ind_b[k],] <- B[Ind_b[k],]
-        a <- min(as.vector(res$MatVrai)[which(as.vector(res$MatVrai)!=0)])
-        Ind_a <- which(as.vector(B[Ind_b[k],])!=0)
-        res$MatVrai[Ind_b[k],][Ind_a] <- a
-      }
-    }
-    
-    
-    ### Iterations
-    Vrai[2] <- LogVraiF(res$MatVrai)
-    test <- abs(Vrai[2]-Vrai[1])
-    Vrai[1] <- Vrai[2]
-    Rs <- Rs+1
-    print(test)
+    dif.lik <- abs(sum(log(apply(lst.rs$mat.phi,1,sum)))-sum(log(apply(res.Exp$mat.phi,1,sum))))
+    lst.rs <- list(theta=theta,mat.flou=res.Exp$mat.flou,mat.phi=res.Exp$mat.phi,conv=conv)
+    it <- it + 1
+    print(paste("Iteration",it,": Likelihood diff = ",dif.lik))
   }
-  Rg <- apply(res$MatVrai,1,which.max)
-  return(list(theta=theta,Rg=Rg,Rs=Rs,Vrai=Vrai[1]))
+  
+  ### results
+  if(it==it.max)
+  {
+    conv <- 0
+    lst.rs <- list(theta=theta,mat.flou=res.Exp$mat.flou,mat.phi=res.Exp$mat.phi,conv=conv)
+    ic <- icl.Mclust.MLMM(lst.rs,Dt)$ICL
+    return(list(theta=lst.rs$theta,matflou=lst.rs$mat.flou,mat.phi=lst.rs$mat.phi,ICL=ic,conv=lst.rs$conv))
+  }else
+  {
+    conv <- 1
+    lst.rs <- list(theta=theta,mat.flou=res.Exp$mat.flou,mat.phi=res.Exp$mat.phi,conv=conv)
+    ic <- icl.Mclust.MLMM(lst.rs,Dt)$ICL
+    return(list(theta=lst.rs$theta,matflou=lst.rs$mat.flou,mat.phi=lst.rs$mat.phi,ICL=ic,conv=lst.rs$conv))
+  }
+}
+######################################################################################################################################
+
+
+#################################################################### Tests ############################################################
+
+########################################################## Initialization of classification with Mclust
+Init_class = function(K,Dt, max_try=10)
+{
+  while(max_try>0)
+  {
+    res <- Mclust(Dt,G=K, verbose = FALSE)
+    u <- as.vector(res$classification)
+    A <- as.matrix(table(u,Dt[,ncol(Dt)]))
+    Rg <- as.vector(apply(A,2,which.max))
+    if(length(unique(Rg))==K) {
+      message(max_try)
+      return(Rg)
+    }
+    max_try <- max_try-1
+  }
+  return(1)
 }
 
 
+################################################################## Simulation functions
+MatRep = function(x,a)
+{
+  return(as.matrix(rep(a,x),ncol=1))
+}
 
+DesInd = function(a)
+{
+  b <- list()
+  b[[1]] <- c(rep(1,a[1]),rep(0,sum(a[2:length(a)])))
+  for(k in 2:(length(a)-1)){
+    b[[k]] <- c(rep(0,sum(a[1:(k-1)])),rep(1,a[k]),rep(0,sum(a[(k+1):length(a)])))
+  }
+  b[[length(a)]] <- c(rep(0,sum(a[1:(length(a)-1)])),rep(1,a[length(a)]))
+  matrix(unlist(b),ncol=length(a))
+}
 
-########## Codes for data simulations
+VarCp = function(k,MatVar,z0,z1,z2)
+{
+  a <- (MatVar[1,k]*(z0%*%t(z0))+(MatVar[2,k]*(z1%*%t(z1)))+(MatVar[3,k]*(z2%*%t(z2))))
+  return(a)
+}
 
-
-
-#################################################################################################################################################################
-
-### Simulation of well separetad populations. np: number of populations; p: number of explonatory variables; n: number of individuals; S: number of species;
-### i: minimal number of individuals per species; rp: number of repetitions.
-
-
-SimData = function(R,np,p,n=500,S=50,i=5,rp=10){
-  #### Repartion of individual in species
-  j <- 0
-  while(j<i)
+######################################################################### Function for simulations
+SimData2 = function(np = 4,p.Repart = c(0.4,0.3,0.2,0.1),p=2,sdb=3,sdv=1,S=70){
+  
+  #### Repartion of individual in species with repetitions
+  ni <- sample(5:15,S,replace = T)
+  rpList <- list()
+  for(i in 1:S)
   {
-    ni <- as.vector(table(sample(1:S,n,replace=T)))
-    j <- min(ni)
+    rpList[[i]] <- sample(5:20,ni[i],replace = T)
   }
   
+  ##### Design matrix
+  Z0 <- lapply(sapply(rpList,sum),diag)
+  Z1 <- lapply(rpList,DesInd)
+  Z2 <- lapply(sapply(rpList,sum),MatRep,1)
   
-  ##### creation of Z0 
-  Z0 <- list()
-  for(s in 1:S){
-    Z0[[s]] <- diag(ni[s]*rp)
-  }
-  
-  #### Creation of Z1
-  Z1 <- list()
-  M1 <- matrix(rep(1,rp),ncol=1)
-  for(s in 1:S){
-    Z1[[s]] <- diag(ni[s])%x%M1
-  } 
-  
-  #### Creation of Z2
-  Z2 <- list()
-  for(s in 1:S){
-    Z2[[s]] <- matrix(rep(1,rp*ni[s]),ncol=1)
-  } 
-  
-  ### Simulation of variances
-  sigma <- list()
-  for(k in 1:np){
-    sigma[[k]] <- runif(3,0.2,1)
-  }
+  ### Parameters
+  MatBeta <- matrix(rnorm((p+1)*np,sample(c(-1,1),p+1,replace = T),sdb),p+1)
+  MatVar <- rbind(rep(1,np),matrix(rgamma(p*np,shape=sdv,scale=1/sdv),p))
   
   ### Creation of variance matrix
-  MatSigma1 <- list()
   MatSigma <- list()
   for(s in 1:S){
-    for(k in 1:np){
-      MatSigma1[[k]] <- (sigma[[k]][1]*(Z0[[s]]%*%t(Z0[[s]])))+(sigma[[k]][2]*(Z1[[s]]%*%t(Z1[[s]])))+(sigma[[k]][3]*(Z2[[s]]%*%t(Z2[[s]]))) 
-    }
-    MatSigma[[s]] <- MatSigma1
+    MatSigma[[s]] <- lapply(1:np,VarCp,MatVar,Z0[[s]],Z1[[s]],Z2[[s]])
   }
   
   ### Simulation of explonatory variables
   X <- list()
   for(s in 1:S){
-    a <- rep(1,ni[s]*rp )
-    X[[s]] <- cbind(a,matrix(rnorm(ni[s]*p*rp,0,1),nrow=ni[s]*rp,ncol=p))
-  }
-  
-  ### Simulations of beta-k
-  Beta <- list()
-  MatBeta <- t(runif_on_cube(n=G,d=p+1,r=R))
-  for(k in 1:np){
-    Beta[[k]] <- MatBeta[,k]
+    a <- rep(1,sum(rpList[[s]]))
+    X[[s]] <- cbind(a,matrix(rnorm(sum(rpList[[s]])*p,0,1),nrow=sum(rpList[[s]]),ncol=p))
   }
   
   
   ### Creation of Ys
-  Groups <- sample(1:np,S,replace=T)
+  a <- S*p.Repart
+  Groups <- sample(rep(1:np,a))
   Y <- list()
   for(s in 1:S){
     k <- Groups[[s]]
-    Bet <- matrix(Beta[[k]],ncol=1)
+    Bet <- matrix(MatBeta[,k],ncol=1)
     Xe <- X[[s]]
     V <- MatSigma[[s]][[k]]
     Mu <- Xe%*%Bet
@@ -561,10 +501,14 @@ SimData = function(R,np,p,n=500,S=50,i=5,rp=10){
   }
   
   ### indexation
-  indI <- rep(1:n,each=rp)
-  indEs <- rep(1,ni[1]*rp)
+  rp <- unlist(rpList)
+  indI <- rep(1,rp[1])
+  for(i in 2:sum(ni)){
+    indI <- c(indI,rep(i,rp[i]))
+  }
+  indEs <- rep(1,sum(rpList[[1]]))
   for(s in 2:S){
-    indEs <- c(indEs,rep(s,ni[s]*rp))
+    indEs <- c(indEs,rep(s,sum(rpList[[s]])))
   }
   
   
@@ -572,204 +516,51 @@ SimData = function(R,np,p,n=500,S=50,i=5,rp=10){
   data <- as.data.frame((cbind(Yf,Xf[,-1],indI,indEs)))
   
   ### Results
-  res<- list() 
-  
-  res$data <- data
-  
+  res<- list()
+  res$Data <- data
   res$class <- Groups
-  
-  MatBeta <- matrix(Beta[[1]],ncol=1)
-  for(k in 2:np){
-    MatBeta <- cbind(MatBeta,matrix(Beta[[k]],ncol=1))
-  }
   res$Beta <- MatBeta
-  
-  sigmaRes <- sigma[[1]][1]
-  sigmaInd <- sigma[[1]][2]
-  sigmaEs <- sigma[[1]][3]
-  for(k in 2:np){
-    sigmaRes <- c(sigmaRes,sigma[[k]][1])
-    sigmaInd <- c(sigmaInd,sigma[[k]][2])
-    sigmaEs <- c(sigmaEs,sigma[[k]][3])
-  }
-  res$sigmaRes <- sigmaRes
-  res$sigmaInd <- sigmaInd
-  res$sigmaEs <- sigmaEs
-  res$ni <- ni
-  
+  res$MatVar <- MatVar
+  res$Ni <- ni
   return(res)
 }
 
-MatBetaSphere = function(R,p,np){
-  MatBeta <- matrix(ncol=np,nrow=p+1)
-  for(k in 1:np){
-    b <- -1
-    while(b<0){
-      bt <- c()
-      bt[1] <- runif(1,0,R)
-      for(j in 2:(p)){
-        bt[j] <- runif(1,0,R-bt[j-1])
-      }
-      b <- R-sum(bt)
-    }
-    bt[p+1] <- b
-    a <- sample(c(-1,1),p+1,replace=T)
-    u <- sqrt(bt)*a
-    MatBeta[,k] <- u
-  }
-  return(MatBeta)
-}
 
-
-#### indicators
-
-Ind_Regr=function(u_res,uInit)
+################################################################################### tests
+Rg <- 1
+while(length(Rg)==1)
 {
-  S <- length(uInit)
-  A <- as.matrix(table(uInit,u_res))
-  I1 <- sum(apply(A,1,max))/S
-  I2 <- sum(apply(A,2,max))/S
-  return(c(I1,I2))
+  sd <- 3
+  alpha <- 1
+  Sim.Data <- SimData2(sdb = sd, sdv = alpha,S=50)
+  Dt <- as.data.frame(Sim.Data$Data)
+  K <- 4
+  Rg <- Init_class(K,Dt)
 }
 
+### M3
+form <- Yf ~ V2 + V3 + (1|indEs) + (1|indI:indEs)
+Dt <- as.data.frame(Sim.Data$Data)
+grping.Fact <- "indEs"
+rd.Fact <- c("indI","indEs")
+init.Clst <- Rg
+res <- MLMM(form,Dt,init.Clst,grping.Fact,rd.Fact)
 
+### M2
+Dt <- as.data.frame(Dt)
+rd.Fact <- c("indI")
+form <- Yf ~ V2 + V3 + (1|indI:indEs)
+res2 <- MLMM(form,Dt,init.Clst,grping.Fact,rd.Fact)
 
-RMS_Beta= function(MatBetaR,MatBetaEs)
-{
-  G <- ncol(MatBetaR)
-  P <- nrow(MatBetaR)
-  uG <- c()
-  for(k in 1:G)
-  {
-    uP <- c()
-    for(t in 1:P)
-    {
-      uP[t] <- ((MatBetaR[t,k]-MatBetaEs[t,k])^2/abs(MatBetaR[t,k]))/G*P
-    }
-    uG[k] <- sum(uP)
-  }
-  Rslt <- sqrt(sum(uG))
-  return(Rslt)
-}
+### M1
+Dt <- as.data.frame(Dt)
+rd.Fact <- c("indEs")
+form <- Yf ~ V2 + V3 + (1|indEs)
+res3 <- MLMM(form,Dt,init.Clst,grping.Fact,rd.Fact)
 
-
-RMS_Sigma= function(SigmaR,SigmaEs)
-{
-  G <- length(SigmaR)
-  uG <- c()
-  for(k in 1:G)
-  {
-    uG[k] <- ((SigmaR[k]-SigmaEs[k])^2/abs(SigmaR[k]))/G
-  }
-  Rslt <- sqrt(sum(uG))
-  return(Rslt)
-}
-
-
-#### Tests
-
-G <- 9
-formula <- Yf~V2+V3
-r <- 0.5
-ReSim <- SimData(R=r,np=G,p=2,n=300,S=16,rp=12)
-Data <- ReSim$data
-res <- EstimF(formula,Data,G)
-
-### Classification
-Ind_R <- Ind_Regr(res$Rg,ReSim$class)
-(I1 <- Ind_R[1])
-(I2 <- Ind_R[2])
-(It <- res$Rs)
-
-### Class switching
-u <- c()
-A <- as.matrix(table(res$Rg,ReSim$class))
-for(k in 1:G){
-  a <- as.vector(A[,k])
-  u[k] <- which.max(a)
-}
-
-### Adjustment
-(D_Beta <- RMS_Beta(ReSim$Beta[,u],res$theta$MatBeta))
-(D_Vi <- RMS_Sigma(ReSim$sigmaInd[u],res$theta$Vi))
-(D_Vr <- RMS_Sigma(ReSim$sigmaRes[u],res$theta$Vr))
-(D_Ve <- RMS_Sigma(ReSim$sigmaEs[u],res$theta$Ve))
-
-
-### Implementation function
-
-Imple = function(r,G,nb=100,p=6,n=500,S=50,rp=10,formula=Yf~V2+V3+V4+V5+V6+V7){
-  
-  # Initialization
-  I1 <- c()
-  I2 <- c()
-  It <- c()
-  D_Beta <- c()
-  D_Vr <- c()
-  D_Vi <- c()
-  D_Ve <- c()
-  
-  # Begin of iterations
-  for(k in 1:nb){
-    
-    # Simulations
-    ReSim <- SimData(R=r,np=G,p=p,n=n,S=S,rp=rp)
-    Data <- ReSim$data
-    
-    # Estimations
-    res <- EstimF(formula,Data,G)
-    
-    # Class switching
-    u <- c()
-    A <- as.matrix(table(res$Rg,ReSim$class))
-    for(m in 1:G){
-      a <- as.vector(A[,m])
-      u[m] <- which.max(a)
-    }
-    
-    # Classification indicators
-    Ind_R <- Ind_Regr(res$Rg,ReSim$class)
-    I1[k] <- Ind_R[1]
-    I2[k] <- Ind_R[2]
-    
-    # Number of itarations
-    It[k] <- res$Rs
-    
-    # Fitting indicators
-    if(length(unique(u))==G){
-      D_Beta[k] <- RMS_Beta(ReSim$Beta[,u],res$theta$MatBeta)
-      D_Vi[k] <- RMS_Sigma(ReSim$sigmaInd[u],res$theta$Vi)
-      D_Vr[k] <- RMS_Sigma(ReSim$sigmaRes[u],res$theta$Vr)
-      D_Ve[k] <- RMS_Sigma(ReSim$sigmaEs[u],res$theta$Ve)
-    }
-    
-    print(k)
-  }
-  
-  # Results
- 
-  ResImple <- list()
-  ResImple$I1 <- mean(!is.na(I1))
-  ResImple$I2 <- mean(!is.na(I2))
-  ResImple$It <- mean(!is.na(It))
-  ResImple$Beta <- mean(!is.na(D_Beta))
-  ResImple$Vr <- mean(!is.na(D_Vr)) 
-  ResImple$Vi <- mean(!is.na(D_Vi))
-  ResImple$Ve <- mean(!is.na(D_Ve))
-  return(ResImple)
-}
-
-
-##### Applications
-
-ResR50G3 <- Imple(r=50,G=3)
-ResR50G6 <- Imple(r=50,G=6)
-ResR50G9 <- Imple(r=50,G=9)
-
-ResR5G3 <- Imple(r=5,G=3)
-ResR5G6 <- Imple(r=5,G=6)
-ResR5G9 <- Imple(r=5,G=9)
-
-ResR05G3 <- Imple(r=0.5,G=3)
-ResR05G6 <- Imple(r=0.5,G=6)
-ResR05G9 <- Imple(r=0.5,G=9)
+### M0
+form <- Yf ~ V2 + V3|indEs
+Dt <- as.data.frame(Sim.Data$Data)
+res4 <- flexmix(form,k=K,Dt)
+ICL(res4)
+#######################################################################################################################################
