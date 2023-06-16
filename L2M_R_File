@@ -52,7 +52,7 @@ prepa_List = function(form,Dt, grping.Fact, rd.Fact)
     lst.lev <- list()
     for(s in 1:S)
     {
-      lst.lev[[s]] <- as.matrix(dcast(Dt2[Dt2[[rd.Fact[length(rd.Fact)]]]==s], as.formula(paste("idMes~",paste(b))), fun.aggregate = length)[,-1])
+      lst.lev[[s]] <- as.matrix(dcast(Dt2[Dt2[[grping.Fact]]==s], as.formula(paste("idMes~",paste(b))), fun.aggregate = length)[,-1])
     }
     glb.Z[[i]] <- lst.lev
   }
@@ -74,7 +74,6 @@ prepa_List = function(form,Dt, grping.Fact, rd.Fact)
   ### results
   return(list(Ys = lst.Y,Xs = lst.X, Zs = lst.Z,Zts = lst.Zt,ind.Sp=ind.Sp))
 }
-
 
 ######################################################################### Initialization function
 Init = function(Dt,init.Clst,ind.Sp,form,rd.Fact,p)
