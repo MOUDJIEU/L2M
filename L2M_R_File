@@ -1,5 +1,6 @@
 
-############################################################ libraries ################################################################
+######################################### Mixture of multilevels random regression function ########################################
+##################### libraries
 library(MASS)
 library(nlme)
 library(flexmix)
@@ -10,12 +11,489 @@ library(flexmix)
 library(lme4)
 library(mvtnorm)
 library(mclust)
-########################################################################################################################################
+library(Matrix)
+library(rlist)
+##################### Function for list of designs
+dsg.List = function(Dt,p,ind.slope,sp.slope)
+{
+  ### Regression data
+  dt.Reg <- Dt[,1:(p+1)]
+  dt.Reg[,1] <- rep(1,nrow(dt.Reg))
+  names(dt.Reg)[1] <- "Itcp"
+  ### Regression matrix for each individual: mt.X[[s]][[i]] = X_si
+  id.Sp <- as.numeric(Dt[,p+3])
+  id.Ind <- as.numeric(Dt[,p+2])
+  S <- length(unique(id.Sp))
+  mt.X <- list()
+  for(s in 1:S)
+  {
+    id.si <- id.Ind[which(id.Sp==s)]
+    a <- unique(id.si)
+    mt.si <- list()
+    for(i in 1:length(a))
+    {
+      mt.si[[i]] <- dt.Reg[which(id.Ind==a[i]),]
+    }
+    mt.X[[s]] <- mt.si
+  }
+  ### list of Ys vectors
+  mt.Ys <- list()
+  for(s in 1:S)
+  {
+    mt.Ys[[s]] <- Dt[which(id.Sp==s),1]
+  }
+  ### list of individual index for species
+  mt.id.ind <- list()
+  for(s in 1:S)
+  {
+    mt.id.ind[[s]] <- Dt[which(id.Sp==s),p+2]
+  }
+  ### list index for species
+  mt.id.sp <- list()
+  for(s in 1:S)
+  {
+    mt.id.sp[[s]] <- Dt[which(id.Sp==s),p+3]
+  }
+  ### list of Xs matrix 
+  mt.Xs <- list()
+  for(s in 1:S)
+  {
+    mt.Xs[[s]] <- do.call(rbind,mt.X[[s]])
+  }
+  ### Product of design matrix for species random effects
+  mt.Hs <- list()
+  for(s in 1:S)
+  {
+    Xs <- mt.Xs[[s]]
+    mt.Ds <- lapply(seq_len(ncol(Xs)),function(i)as.matrix(Xs[,i],ncol=1)%*%t(as.matrix(Xs[,i],ncol=1)))
+    mt.Hs[[s]] <- mt.Ds  
+  }
+  mt.Hs.id <- list()
+  for(s in 1:S)
+  {
+    sp.H <- list()
+    for(i in 1:length(sp.slope))
+    {
+      sp.H[[i]] <- as.matrix(mt.Hs[[s]][[sp.slope[i]]])
+    }
+    mt.Hs.id[[s]] <- sp.H
+  }
+  ### Product of design matrix for individual within species
+  mt.Hi <- list()
+  for(s in 1:S)
+  {
+    mt.Di <- list()
+    for(i in 1:(p+1))
+    {
+      A <- as.matrix(bdiag(lapply(mt.X[[s]],function(x)x[,i])))
+      mt.Di[[i]] <- A%*%t(A)
+    }
+    mt.Hi[[s]] <- mt.Di
+  }
+  mt.Hi.id <- list()
+  for(s in 1:S)
+  {
+    Ind.H <- list()
+    for(i in 1:length(ind.slope))
+    {
+      Ind.H[[i]] <- as.matrix(mt.Hi[[s]][[ind.slope[i]]])
+    }
+    mt.Hi.id[[s]] <- Ind.H
+  }
+  ### Design matrix for residual error
+  mt.Hr <- list()
+  for(s in 1:S)
+  {
+    mt.Hr[[s]] <- diag(1,nrow=nrow(mt.Xs[[s]]))
+  }
+  
+  ### Results
+  return(list(mt.ind = mt.id.ind, mt.sp=mt.id.sp, mt.Ys = mt.Ys, mt.Xs = mt.Xs, mt.Dr = mt.Hr, mt.Di = mt.Hi.id, mt.Ds = mt.Hs.id))
+}
+##################### Initialization
+Init.slope = function(form,Dt,ind.slope,sp.slope,init.Clst,mt.Xs,mt.Ys,mt.id.ind,mt.id.sp,p=2)
+{
+  ### pi initialization
+  K <- length(unique(init.Clst))
+  pi <- c()
+  S <- length(init.Clst)
+  for(k in 1:K)
+  {
+    pi[k] <- sum(init.Clst==k)/S
+  }
+  ### fixed coefficients and random effect variances initialization
+  mat.Beta <- matrix(NA,ncol=K,nrow=p+1)
+  Nr <- length(ind.slope) + length(sp.slope) + 1
+  mat.Var <- matrix(NA,ncol=K,nrow=Nr)
+  for(k in 1:K)
+  {
+    u <- which(init.Clst==k)
+    X.k <- do.call(rbind,lapply(u,function(i)mt.Xs[[i]]))
+    Y.k <- unlist(lapply(u,function(i)mt.Ys[[i]]))
+    id.ind.k <- unlist(lapply(u,function(i)mt.id.ind[[i]]))
+    id.sp.k <- unlist(lapply(u,function(i)mt.id.sp[[i]]))
+    Dt.k <- cbind(Y.k,X.k[,-1],id.ind.k,id.sp.k)
+    names(Dt.k) <- names(Dt)
+    rs <- lmer(form,Dt.k)
+    mat.Beta[,k] <- as.numeric(getME(rs,"fixef"))
+    u <- c(as.numeric(getME(rs,"sigma")),rep(as.numeric(getME(rs,"theta"))[[1]],length(ind.slope)),rep(as.numeric(getME(rs,"theta"))[[2]],length(sp.slope)))
+    u[which(u<=0)] <- 0.01
+    mat.Var[,k] <- u
+  }
+  ### results
+  return(list(pi=pi,mat.Beta=mat.Beta,mat.Var=mat.Var))
+}
+##################### Expectation
+Exp.slope = function(mt.Dr,mt.Di,mt.Ds,mt.Xs,mt.Ys,ind.slope,sp.slope,theta)
+{
+  K <- length(theta$pi)
+  S <- length(mt.Dr)
+  ### Variance matrix
+  Sg <- list()
+  for(s in 1:S)
+  {
+    sgs <- list()
+    mt.Rs <- mt.Dr[[s]]
+    Ds <- mt.Ds[[s]]
+    Di <- mt.Di[[s]]
+    for(k in 1:K)
+    {
+      u <- theta$mat.Var[,k]
+      u1 <- u[2:(length(ind.slope)+1)]
+      u2 <- u[(length(ind.slope)+2):length(u)]
+      
+      Vs <- mt.Rs*u[1] 
+      for(i in 1:length(ind.slope))
+      {
+        Vs <- Vs + Di[[i]]*u1[i] 
+      }
+      for(i in 1:length(sp.slope))
+      {
+        Vs <- Vs + Ds[[i]]*u2[i] 
+      }
+      sgs[[k]] <- Vs
+    }
+    Sg[[s]] <- sgs
+  }
+  ### Matrix of likelihood
+  mat.phi <- matrix(NA,ncol=K,nrow=S)
+  for(s in 1:S)
+  {
+    for(k in 1:K)
+    {
+      sig.sk <- Sg[[s]][[k]]
+      X.s <- as.matrix(mt.Xs[[s]])
+      beta.k <- matrix(theta$mat.Beta[,k],ncol=1)
+      Mu.s <- X.s %*% beta.k
+      Y.s <- as.numeric(mt.Ys[[s]])
+      mat.phi[s,k] <-theta$pi[k]*mvtnorm::dmvnorm(x = Y.s, mean = Mu.s, sigma = sig.sk)
+    }
+  }
+  ### prior matrix
+  mat.flou <- t(apply(mat.phi,1,function(x){x/sum(x)}))
+  ### results
+  return(list(mat.flou=mat.flou,mat.phi=mat.phi,mat.Var=Sg))
+}
+##################### Maximization
+Maxi.slope = function(p,rs.Exp,mt.Xs,mt.Ys,mt.Dr,mt.Di,mt.Ds,ind.slope,sp.slope)
+{
+  S <- length(mt.Di)
+  ### Extraction de la matrice flou effective
+  mat.flou <- rs.Exp$mat.flou
+  Sg <- rs.Exp$mat.Var
+  for(k in 1:ncol(mat.flou))
+  {
+    u <- mat.flou[,k]
+    u[which(u<1e-06)] <- 0
+    mat.flou[,k] <- u
+  }
+  ### Calcul de pi
+  pi <- apply(mat.flou,2,sum)/nrow(mat.flou)
+  ### Nouveau K
+  K <- length(pi)
+  ### Calcul inverse matrix
+  Inv.Sg <- list()
+  for(s in 1:S)
+  {
+    Inv.Sg[[s]] <- lapply(Sg[[s]],solve)
+  }
+  ### Beta maximization 
+  mat.Beta <- matrix(NA,nrow=p+1,ncol=K)
+  for(k in 1:K)
+  {
+    A1 <- list()
+    A2 <- list()
+    w <- mat.flou[,k]
+    for(s in 1:S)
+    {
+      A1[[s]] <- w[s]*(t(as.matrix(mt.Xs[[s]]))%*%Inv.Sg[[s]][[k]]%*%as.matrix(mt.Xs[[s]]))
+      A2[[s]] <- w[s]*(t(as.matrix(mt.Xs[[s]]))%*%Inv.Sg[[s]][[k]]%*%mt.Ys[[s]])
+    }
+    mat.Beta[,k] <- solve(Reduce("+",A1))%*%Reduce("+",A2)
+  }
+  ### M matrix computing
+  Nr <- length(ind.slope) + length(sp.slope) + 1
+  mat.Var <- matrix(NA,ncol=K,nrow=Nr)
+  for(k in 1:K)
+  {
+    ### Compute M matrix
+    M <- matrix(NA,ncol=Nr,nrow=Nr)
+    w <- mat.flou[,k]
+    for(i in 1:Nr)
+    {
+      for(j in 1:Nr)
+      {
+        az <- c()
+        for(s in 1:S)
+        {
+          H <- c(list(mt.Dr[[s]]),mt.Di[[s]],mt.Ds[[s]])
+          Aij <- Inv.Sg[[s]][[k]]%*%as.matrix(H[[i]])%*%Inv.Sg[[s]][[k]]%*%as.matrix(H[[j]])
+          az[s] <- w[s]*sum(diag(Aij))
+        }
+        M[i,j] <- sum(az)
+      }
+    }
+    ### Compute R vector
+    R <- c()
+    for(i in 1:Nr)
+    {
+      aR <- c()
+      for(s in 1:S)
+      {
+        H <- c(list(mt.Dr[[s]]),mt.Di[[s]],mt.Ds[[s]])
+        Mu <- matrix(mt.Ys[[s]],ncol=1)-as.matrix(mt.Xs[[s]])%*%mat.Beta[,k]
+        aR[s] <- as.vector(w[s]*(t(Mu)%*%Inv.Sg[[s]][[k]]%*%H[[i]]%*%Inv.Sg[[s]][[k]]%*%Mu))
+      }
+      R[i] <- sum(aR)
+    } 
+    ### Compute variances
+    mat.Var[,k] <- solve(M,R)
+  }
+  ### Results
+  theta <- list()
+  theta$pi <- pi
+  theta$mat.Beta <- mat.Beta
+  theta$mat.Var <- mat.Var
+  return(theta)
+}
+##################### The ICL
+icl.Mclust.MLMM <- function(res,Dt)
+{
+  if(class(res)=="try-error")
+  {
+    return(NA)
+  } else 
+  {
+    n <- nrow(Dt)
+    ## Matrix of probabilities
+    u <- Dt[,ncol(Dt)]
+    mat.Flou <- res$mat.flou
+    z <- matrix(0,nrow=length(u),ncol=ncol(mat.Flou))
+    for(kk in 1:nrow(mat.Flou))
+    {
+      a <- which(u==kk)
+      b <- mat.Flou[kk,]
+      for(kkk in 1:length(a))
+      {
+        z[a[kkk],] <- b
+      }
+    }
+    ## Matrix of behaviors
+    if(is.null(z)) z <- matrix(1, nrow = n, ncol = 1)
+    C <- matrix(0, n, ncol(z))
+    for(i in 1:n)
+      C[i, which.max(z[i,])] <- 1
+    ## ICL
+    log.vrai <- sum(log(apply(res$mat.phi,1,sum)))
+    N <- length(u)
+    k <- ncol(res$theta$mat.Beta)*(nrow(res$theta$mat.Beta)+nrow(res$theta$mat.Var))
+    bi <- (-2*log.vrai)+(k*log(N))
+    ic <- bi - 2*sum(C * ifelse(z > 0, log(z), 0))
+    return(list(BIC=bi,ICL=ic))
+  }
+}
+##################### The main function #####################
+MLMM.slope = function(form,Dt,p,init.Clst,ind.slope,sp.slope,eps=0.001,it.max=30)
+{
+  ### Data preparation
+  a <- dsg.List(Dt,p,ind.slope,sp.slope)
+  mt.Ys <- a$mt.Ys
+  mt.Xs <- a$mt.Xs
+  mt.Dr <- a$mt.Dr
+  mt.Di <- a$mt.Di
+  mt.Ds <- a$mt.Ds
+  mt.id.ind <- a$mt.ind
+  mt.id.sp <- a$mt.sp
+  ### Initialization
+  theta <- Init.slope(form,Dt,ind.slope,sp.slope,init.Clst,mt.Xs,mt.Ys,mt.id.ind,mt.id.sp,p=2)
+  ### First expectation and likelihood
+  res.Exp <- Exp.slope(mt.Dr,mt.Di,mt.Ds,mt.Xs,mt.Ys,ind.slope,sp.slope,theta)
+  lik1 <-  sum(log(apply(res.Exp$mat.phi,1,sum)))
+  ### EM loop
+  it <- 0
+  dif.lik <- eps+1
+  while((it<it.max)&(dif.lik>eps))
+  {
+    ### Maximization
+    theta <- Maxi.slope(p,res.Exp,mt.Xs,mt.Ys,mt.Dr,mt.Di,mt.Ds,ind.slope,sp.slope)
+    ### New expectation and likelihood
+    res.Exp <- Exp.slope(mt.Dr,mt.Di,mt.Ds,mt.Xs,mt.Ys,ind.slope,sp.slope,theta)
+    lik2 <-  sum(log(apply(res.Exp$mat.phi,1,sum)))
+    ### update values for loop condition
+    dif.lik = abs(lik1-lik2)
+    it <- it + 1
+    prv.lik <- lik1
+    lik1 <- lik2
+    print(paste("Iteration: ",it," ;Log.lik = ",prv.lik," ;Log.lik diff = ",dif.lik))
+  }
+  ### Results
+  if(it==it.max)
+  {
+    conv <- 0
+    lst.rs <- list(theta=theta,mat.flou=res.Exp$mat.flou,mat.phi=res.Exp$mat.phi,conv=conv)
+    ic <- icl.Mclust.MLMM(lst.rs,Dt)$ICL
+    return(list(theta=lst.rs$theta,matflou=lst.rs$mat.flou,mat.phi=lst.rs$mat.phi,ICL=ic,conv=lst.rs$conv))
+  }else
+  {
+    conv <- 1
+    lst.rs <- list(theta=theta,mat.flou=res.Exp$mat.flou,mat.phi=res.Exp$mat.phi,conv=conv)
+    ic <- icl.Mclust.MLMM(lst.rs,Dt)$ICL
+    return(list(theta=lst.rs$theta,matflou=lst.rs$mat.flou,mat.phi=lst.rs$mat.phi,ICL=ic,conv=lst.rs$conv))
+  }
+}
+######################################################################################################################################
+######################################################################################################################################
+######################################################################################################################################
 
 
-############################################################# Estimation functions ####################################################
+#########################################  A simulation (in a general case) test for "MLMM.slope" ########################################
+##################### Simulation functions
+Simul.Slope = function(sdv,sdb,S=70,K=4,p=2,ni.Min=5,ni.Max=20,mes.Min=5,mes.Max=15)
+{
+  ### List of vector of number of measurement per individual for each species
+  lst.Mes <- sapply(sample(ni.Min:ni.Max,S,replace=T),function(x)sample(mes.Min:mes.Max,x,replace=T))
+  
+  ### List of matrix of explanatory variables per individual
+  lst.Mat.Ind <- lapply(lst.Mes,function(x)sapply(x,function(y)cbind(rep(1,y),matrix(rnorm(y*p,0,1),nrow=y,ncol=p))))
+  
+  ### List of matrix of explanatory variables per species
+  lst.Mat.Sp <- lapply(lst.Mat.Ind,function(x)do.call("rbind",x))
+  
+  ### List of design matrix for residual error
+  lst.Dg.Res <- lapply(lst.Mes,function(x)diag(1,sum(x)))
+  
+  ### List of design matrix for species variance
+  lst.Dg.Sp <- lapply(lst.Mat.Sp,function(x){
+    ls <- list()
+    for(m in 1:ncol(x))
+    {
+      ls[[m]] <- x[,m]%*%t(x[,m])
+    }
+    return(ls)
+  })
+  
+  ### List of design matrix for individual within species variance
+  lst.Dg.Ind <- lapply(lst.Mat.Ind,function(x){
+    ls <- list()
+    for(m in 1:ncol(x[[1]]))
+    {
+      A <- as.matrix(bdiag(lapply(x,function(y)y[,m])))
+      ls[[m]] <- A%*%t(A)
+    }
+    return(ls)
+  })
+  
+  ### Simulation of variances
+  lst.Sg.Res <- lapply(1:K,function(x)rgamma(1,shape=sdv,scale=1/sdv))
+  lst.Sg.Ind <- lapply(1:K,function(x)rgamma(p+1,shape=sdv,scale=1/sdv))
+  lst.Sg.Sp <- lapply(1:K,function(x)rgamma(p+1,shape=sdv,scale=1/sdv))
+  
+  ### Simulation of variance matrix
+  lst.Mat.Sg <- list()
+  for(k in 1:K)
+  {
+    lst.Mat.Sg[[k]] <- lapply(1:S,function(s){
+      return(lst.Sg.Res[[k]]*lst.Dg.Res[[s]] + Reduce("+",lapply(1:(p+1),
+                                                                 function(x)lst.Dg.Ind[[s]][[x]]*lst.Sg.Ind[[k]][[x]])) + Reduce("+",lapply(1:(p+1),function(x)lst.Dg.Sp[[s]][[x]]*lst.Sg.Sp[[k]][[x]])))
+    })
+  }
+  
+  ### Simulation of fixed effects
+  lst.Beta <- lapply(1:K,function(k)rnorm(p+1,sample(c(-1,1),p+1,replace = T),sdb))
+  
+  ### True classification
+  Classif <- sample(1:K,S,replace=T)
+  
+  ### Simulation of Ys
+  lst.Ys <- sapply(1:S,function(s)as.numeric(rmvnorm(1,mean=lst.Mat.Sp[[s]]%*%lst.Beta[[Classif[s]]],
+                                                     sigma=lst.Mat.Sg[[Classif[s]]][[s]])))
+  
+  ### Data frame
+  Dat.Sim  <- cbind(unlist(lst.Ys),do.call(rbind,lst.Mat.Sp)[,-1])
+  u1 <- unlist(lst.Mes)
+  indI <- unlist(sapply(1:length(u1),function(x)rep(x,u1[x])))
+  u2 <- unlist(lapply(lst.Mes,function(x)sum(x)))
+  indEs <- unlist(sapply(1:length(u2),function(x)rep(x,u2[x])))
+  Dt <- cbind(Dat.Sim,indI,indEs)
+  colnames(Dt)[1:3] <- c("Yf","V2","V3")
+  
+  ### Results
+  res <- list(Dt=Dt, Beta=lst.Beta, var.res = lst.Sg.Res, var.Ind = lst.Sg.Ind, var.Sp = lst.Sg.Sp,Class=Classif)
+  return(res)
+}
+##################### Simulation Test
+### Parameters
+form <- Yf ~ V2 + V3 + (1|indEs) + (1|indI:indEs)
+form1 <- Yf ~ V2 + V3|indEs
+sd <- 3
+alpha <- 1
+### Data simulation
+Sim.Data <- Simul.Slope(sdb = sd, sdv = alpha,S=50)
+Dt <- as.data.frame(Sim.Data$Dt)
+### Initial cluster from "flexmix" package
+# Fit flexmix 10 times
+test.ls <- list()
+ICL.vect <- c()
+for(i in 1:10)
+{
+  test.res <- flexmix(form1,Dt,4)
+  test.ls[[i]] <- test.res
+  ICL.vect[i] <- ICL(test.res)
+}
+# Choose the best flexmix for initialization
+res.init <- test.ls[[which.min(ICL.vect)]]
+# Obtain cluster at species level
+u <- as.vector(clusters(res.init))
+A <- as.matrix(table(u,Dt[,ncol(Dt)]))
+init.Clst <- as.vector(apply(A,2,which.max))
+### Test
+# M6 (with species and individual within species full slope)
+res <- MLMM.slope(form=form,Dt=Dt,p=2,init.Clst,ind.slope=c(1,2,3),sp.slope=c(1,2,3),eps=0.001,it.max=50)
+# M5 (with individual within species full slope) and species random intercept
+res <- MLMM.slope(form=form,Dt=Dt,p=2,init.Clst,ind.slope=c(1,2,3),sp.slope=c(1),eps=0.001,it.max=50)
+# M4 (with species full slope) and individaul within species random intercept
+res <- MLMM.slope(form=form,Dt=Dt,p=2,init.Clst,ind.slope=c(1),sp.slope=c(1,2,3),eps=0.001,it.max=50)
+# M3 without random slope
+res <- MLMM.slope(form=form,Dt=Dt,p=2,init.Clst,ind.slope=c(1),sp.slope=c(1),eps=0.001,it.max=50)
 
-################################################################### Data preparation function
+#######################################################################################################################################
+#######################################################################################################################################
+#######################################################################################################################################
+
+
+######################################## Mixture of multilevel linear mixed model (without) random slope ##############################
+##################### Libraries 
+library(MASS)
+library(nlme)
+library(flexmix)
+library(mvtnorm)
+library(purrr)
+library(data.table)
+library(flexmix)
+library(lme4)
+library(mvtnorm)
+library(mclust)
+##################### Data preparation function
 prepa_List = function(form,Dt, grping.Fact, rd.Fact)
 {
   ### Index of measurement per individuals
@@ -74,8 +552,7 @@ prepa_List = function(form,Dt, grping.Fact, rd.Fact)
   ### results
   return(list(Ys = lst.Y,Xs = lst.X, Zs = lst.Z,Zts = lst.Zt,ind.Sp=ind.Sp))
 }
-
-######################################################################### Initialization function
+##################### Initialization function
 Init = function(Dt,init.Clst,ind.Sp,form,rd.Fact,p)
 {
   ### pi initialization
@@ -105,9 +582,7 @@ Init = function(Dt,init.Clst,ind.Sp,form,rd.Fact,p)
   ### Result
   return(list(pi=pi,mat.Beta=mat.Beta,mat.Var=mat.Var))
 }
-
-
-############################################################################# Expectation function
+##################### Expectation function
 Expectation = function(theta,X,Y,Z,Zt)
 {
   ### parameters of the previous iteration
@@ -150,11 +625,7 @@ Expectation = function(theta,X,Y,Z,Zt)
   ### results
   return(list(mat.flou = mat.flou, mat.phi = mat.phi,lst.mat.Var=lst.Sg))
 }
-
-
-########################################################################### Functions for maximization step
-
-#################################################### Beta maximization function
+##################### Beta maximization function
 Maxi_Beta <- function(Y,X,Inv.mat.var,mat.flou,ind.k)
 {
   mat.beta <- matrix(NA,ncol=length(ind.k),nrow=ncol(X[[1]]))
@@ -183,8 +654,7 @@ Maxi_Beta <- function(Y,X,Inv.mat.var,mat.flou,ind.k)
   }
   return(mat.beta)
 }
-
-################################### M function for varaince maximization
+##################### M function for varaince maximization
 M_funct = function(k,mat.flou,Inv.mat.var,Z,Zt)
 {
   ### affectations
@@ -193,7 +663,6 @@ M_funct = function(k,mat.flou,Inv.mat.var,Z,Zt)
   M <- matrix(ncol=nl,nrow=nl)
   S <- nrow(mat.flou)
   IVk <- Inv.mat.var[[k]]
-  
   ### computing of matrix compoments
   for(i in 1:nl)
   {
@@ -217,8 +686,7 @@ M_funct = function(k,mat.flou,Inv.mat.var,Z,Zt)
   }
   return(M)
 }
-
-###################################### R function for varainces maximization
+##################### R function for varainces maximization
 R_funct = function(k,Y,X,Z,Zt,mat.Beta,Inv.mat.var,mat.flou)
 {
   ### Affectation
@@ -226,7 +694,6 @@ R_funct = function(k,Y,X,Z,Zt,mat.Beta,Inv.mat.var,mat.flou)
   w <- mat.flou[,k]
   nl <- length(Z[[1]])
   IVk <- Inv.mat.var[[k]]
-  
   R <- c()
   for(l in 1:nl)
   {
@@ -244,11 +711,9 @@ R_funct = function(k,Y,X,Z,Zt,mat.Beta,Inv.mat.var,mat.flou)
     }
     R[l] <- sum(aR)
   }
-  
   return(R)
 }
-
-########################### Variance Maximization function
+##################### Variance Maximization function
 Maxi_Var <- function(Y,X,Z,Zt,mat.Beta,mat.flou,Inv.mat.var,ind.k)
 {
   nl <- length(Z[[1]])
@@ -264,9 +729,7 @@ Maxi_Var <- function(Y,X,Z,Zt,mat.Beta,mat.flou,Inv.mat.var,ind.k)
   }
   return(mat.Var)
 }
-
-
-###########################################################################  EM Maximization function
+#####################  EM Maximization function
 Maximization = function(res.Exp,theta,Y,X,Z,Zt)
 {
   ### recuperation of elements
@@ -279,25 +742,21 @@ Maximization = function(res.Exp,theta,Y,X,Z,Zt)
   {
     Inv.mat.var[[k]] <- lapply(lst.mat.Var[[k]],solve)
   }
-  
   ### News K and S
   u1 <- apply(mat.flou,2,sum)
   ind.k <- which(u1!=0)
   u <- u1[ind.k]
   K <- length(u)
   S <- nrow(mat.flou)
-  
   ### News parameters
   pi <- u/S
   mat.Beta <- Maxi_Beta(Y,X,Inv.mat.var,mat.flou,ind.k)
   mat.Var <- Maxi_Var(Y,X,Z,Zt,mat.Beta,mat.flou,Inv.mat.var,ind.k)
   theta <- list(pi=pi,mat.Beta=mat.Beta,mat.Var=mat.Var)
-  
   ### Result
   return(theta)
 }
-
-############################################################################# ICL function
+##################### ICL function
 icl.Mclust.MLMM <- function(res,Dt)
 {
   if(class(res)=="try-error")
@@ -333,12 +792,9 @@ icl.Mclust.MLMM <- function(res,Dt)
     return(list(BIC=bi,ICL=ic))
   }
 }
-
-
-################################################################################ EM function
+##################### The main function #####################
 MLMM = function(form,Dt,init.Clst,grping.Fact,rd.Fact,eps=0.01,it.max=25)
 {
-  
   ### Lists for computing
   rs <- prepa_List(form,Dt,grping.Fact,rd.Fact)
   X <- rs$Xs
@@ -347,7 +803,6 @@ MLMM = function(form,Dt,init.Clst,grping.Fact,rd.Fact,eps=0.01,it.max=25)
   Zt <- rs$Zts
   ind.Sp <- rs$ind.Sp
   p <- ncol(X[[1]])-1
-  
   ### Initial parameters
   theta <- Init(Dt,init.Clst,ind.Sp,form,rd.Fact,p)
   # Test initialization
@@ -360,7 +815,6 @@ MLMM = function(form,Dt,init.Clst,grping.Fact,rd.Fact,eps=0.01,it.max=25)
   }
   conv <- 0
   lst.rs <- list(theta=theta,mat.flou=res.Exp$mat.flou,mat.phi=res.Exp$mat.phi,conv=conv)
-  
   ### Iterations
   it <- 0
   dif.lik <- eps+1
@@ -380,7 +834,6 @@ MLMM = function(form,Dt,init.Clst,grping.Fact,rd.Fact,eps=0.01,it.max=25)
     it <- it + 1
     print(paste("Iteration",it,": Likelihood diff = ",dif.lik))
   }
-  
   ### results
   if(it==it.max)
   {
@@ -397,35 +850,16 @@ MLMM = function(form,Dt,init.Clst,grping.Fact,rd.Fact,eps=0.01,it.max=25)
   }
 }
 ######################################################################################################################################
+######################################################################################################################################
+######################################################################################################################################
 
 
-#################################################################### Tests ############################################################
-
-########################################################## Initialization of classification with Mclust
-Init_class = function(K,Dt, max_try=10)
-{
-  while(max_try>0)
-  {
-    res <- Mclust(Dt,G=K, verbose = FALSE)
-    u <- as.vector(res$classification)
-    A <- as.matrix(table(u,Dt[,ncol(Dt)]))
-    Rg <- as.vector(apply(A,2,which.max))
-    if(length(unique(Rg))==K) {
-      message(max_try)
-      return(Rg)
-    }
-    max_try <- max_try-1
-  }
-  return(1)
-}
-
-
-################################################################## Simulation functions
+######################################## Test of "MLMM" function ########################################
+##################### Simulation functions
 MatRep = function(x,a)
 {
   return(as.matrix(rep(a,x),ncol=1))
 }
-
 DesInd = function(a)
 {
   b <- list()
@@ -436,16 +870,13 @@ DesInd = function(a)
   b[[length(a)]] <- c(rep(0,sum(a[1:(length(a)-1)])),rep(1,a[length(a)]))
   matrix(unlist(b),ncol=length(a))
 }
-
 VarCp = function(k,MatVar,z0,z1,z2)
 {
   a <- (MatVar[1,k]*(z0%*%t(z0))+(MatVar[2,k]*(z1%*%t(z1)))+(MatVar[3,k]*(z2%*%t(z2))))
   return(a)
 }
-
-######################################################################### Function for simulations
+##################### Main function for simulations
 SimData2 = function(np = 4,p.Repart = c(0.4,0.3,0.2,0.1),p=2,sdb=3,sdv=1,S=70){
-  
   #### Repartion of individual in species with repetitions
   ni <- sample(5:15,S,replace = T)
   rpList <- list()
@@ -453,30 +884,24 @@ SimData2 = function(np = 4,p.Repart = c(0.4,0.3,0.2,0.1),p=2,sdb=3,sdv=1,S=70){
   {
     rpList[[i]] <- sample(5:20,ni[i],replace = T)
   }
-  
   ##### Design matrix
   Z0 <- lapply(sapply(rpList,sum),diag)
   Z1 <- lapply(rpList,DesInd)
   Z2 <- lapply(sapply(rpList,sum),MatRep,1)
-  
   ### Parameters
   MatBeta <- matrix(rnorm((p+1)*np,sample(c(-1,1),p+1,replace = T),sdb),p+1)
   MatVar <- rbind(rep(1,np),matrix(rgamma(p*np,shape=sdv,scale=1/sdv),p))
-  
   ### Creation of variance matrix
   MatSigma <- list()
   for(s in 1:S){
     MatSigma[[s]] <- lapply(1:np,VarCp,MatVar,Z0[[s]],Z1[[s]],Z2[[s]])
   }
-  
   ### Simulation of explonatory variables
   X <- list()
   for(s in 1:S){
     a <- rep(1,sum(rpList[[s]]))
     X[[s]] <- cbind(a,matrix(rnorm(sum(rpList[[s]])*p,0,1),nrow=sum(rpList[[s]]),ncol=p))
   }
-  
-  
   ### Creation of Ys
   a <- S*p.Repart
   Groups <- sample(rep(1:np,a))
@@ -489,8 +914,6 @@ SimData2 = function(np = 4,p.Repart = c(0.4,0.3,0.2,0.1),p=2,sdb=3,sdv=1,S=70){
     Mu <- Xe%*%Bet
     Y[[s]] <- mvrnorm(mu=Mu,Sigma=V)
   }
-  
-  
   ### global matrix
   Yf <- Y[[1]]
   Xf <- X[[1]]
@@ -498,7 +921,6 @@ SimData2 = function(np = 4,p.Repart = c(0.4,0.3,0.2,0.1),p=2,sdb=3,sdv=1,S=70){
     Yf <- c(Yf,Y[[s]])
     Xf <- rbind(Xf,X[[s]])
   }
-  
   ### indexation
   rp <- unlist(rpList)
   indI <- rep(1,rp[1])
@@ -509,11 +931,8 @@ SimData2 = function(np = 4,p.Repart = c(0.4,0.3,0.2,0.1),p=2,sdb=3,sdv=1,S=70){
   for(s in 2:S){
     indEs <- c(indEs,rep(s,sum(rpList[[s]])))
   }
-  
-  
   ### Data frame creation
   data <- as.data.frame((cbind(Yf,Xf[,-1],indI,indEs)))
-  
   ### Results
   res<- list()
   res$Data <- data
@@ -523,43 +942,41 @@ SimData2 = function(np = 4,p.Repart = c(0.4,0.3,0.2,0.1),p=2,sdb=3,sdv=1,S=70){
   res$Ni <- ni
   return(res)
 }
-
-
-################################################################################### tests
-Rg <- 1
-while(length(Rg)==1)
+##################### Tests
+### Data simulation
+resDat <- SimData2(np=4)
+Dt <- resDat$Data
+### Initial clustering
+form1 <- Yf ~ V2 + V3|indEs
+test.ls <- list()
+ICL.vect <- c()
+for(i in 1:10)
 {
-  sd <- 3
-  alpha <- 1
-  Sim.Data <- SimData2(sdb = sd, sdv = alpha,S=50)
-  Dt <- as.data.frame(Sim.Data$Data)
-  K <- 4
-  Rg <- Init_class(K,Dt)
+  test.res <- flexmix(form1,Dt,4)
+  test.ls[[i]] <- test.res
+  ICL.vect[i] <- ICL(test.res)
 }
-
-### M3
+### M3 (with species and individual within species random effects) fits
 form <- Yf ~ V2 + V3 + (1|indEs) + (1|indI:indEs)
 Dt <- as.data.frame(Sim.Data$Data)
 grping.Fact <- "indEs"
 rd.Fact <- c("indI","indEs")
 init.Clst <- Rg
 res <- MLMM(form,Dt,init.Clst,grping.Fact,rd.Fact)
-
-### M2
+### M2 (with just individual within species random effects) fits
 Dt <- as.data.frame(Dt)
 rd.Fact <- c("indI")
 form <- Yf ~ V2 + V3 + (1|indI:indEs)
 res2 <- MLMM(form,Dt,init.Clst,grping.Fact,rd.Fact)
-
-### M1
+### M1 (with jsut species random effects) fits
 Dt <- as.data.frame(Dt)
 rd.Fact <- c("indEs")
 form <- Yf ~ V2 + V3 + (1|indEs)
 res3 <- MLMM(form,Dt,init.Clst,grping.Fact,rd.Fact)
-
-### M0
+### M0 (without random effects) fits
 form <- Yf ~ V2 + V3|indEs
 Dt <- as.data.frame(Sim.Data$Data)
 res4 <- flexmix(form,k=K,Dt)
 ICL(res4)
 #######################################################################################################################################
+
